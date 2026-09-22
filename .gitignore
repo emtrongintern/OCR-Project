@@ -1,0 +1,36 @@
+# Python virtual environments
+.venv/
+.venv*/
+*.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model weights & large checkpoint files (GitHub giới hạn tối đa 100MB/file)
+*.pth
+*.pt
+*.onnx
+*.weights
+*.bin
+*.h5
+
+# Kết quả chạy test / output tạm thời
+output/
+OCR_Camera_Results/
+*.log
+
+# IDE & Config cá nhân
+.vscode/
+.idea/
+
+# File tạm hệ thống & Office
+Thumbs.db
+Desktop.ini
+~$*.docx
+~$*.xlsx
+~$*.pptx

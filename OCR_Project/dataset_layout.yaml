@@ -1,0 +1,12 @@
+# File cấu hình tập dữ liệu cho YOLO Layout Detection
+path: ./dataset_layout      # Thư mục gốc chứa dataset
+train: images/train         # Thư mục ảnh huấn luyện
+val: images/val             # Thư mục ảnh kiểm thử (validation)
+
+# Danh sách các lớp (classes) tương ứng với các trường trong tài liệu
+names:
+  0: id             # Trường số ID / CCCD / Mã số (được route vào PP-OCRv6)
+  1: ho_ten         # Trường Họ và tên (được route vào VietOCR)
+  2: ngay_sinh      # Trường ngày sinh (được route vào PP-OCRv6)
+  3: dia_chi        # Trường địa chỉ (được route vào VietOCR)
+  4: que_quan       # Trường quê quán (được route vào VietOCR)
