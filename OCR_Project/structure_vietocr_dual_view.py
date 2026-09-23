@@ -1,28 +1,3 @@
-"""
-Pipeline OCR kết hợp PP-DocLayoutV3 + PP-StructureV3 với VietOCR + PP-OCRv6
-=============================================================================
-Quy trình thực hiện:
-1. PP-DocLayoutV3 + PP-StructureV3:
-   - Chia Khung (Layout Blocks): Phát hiện các vùng cấu trúc (tiêu đề, đoạn văn, bảng biểu, hình ảnh, con dấu...).
-   - Chia Ô (Cells / Text boxes):
-     + Ô trong bảng biểu (Table Cells) từ module Table Recognition (RT-DETR / SLANet).
-     + Ô chữ / dòng chữ (Text Boxes) từ module Text Detection của PP-OCRv6.
-     + Lọc nhiễu, khử trùng lặp (IoU Deduplication) và sắp xếp thứ tự đọc tự nhiên (Reading Order).
-
-2. Nhận diện chữ kết hợp VietOCR + PP-OCRv6:
-   - Cắt (crop) từng ô ảnh kèm padding an toàn chống lệch nét.
-   - Nhận diện song song hoặc định tuyến thông minh:
-     + VietOCR (VGG-Transformer): Chuyên nhận diện chữ tiếng Việt có dấu, họ tên, địa chỉ, văn bản.
-     + PP-OCRv6 (PaddleOCR): Chuyên nhận diện chữ số, mã barcode/ID, ngày tháng, mã ký tự không dấu.
-     + Hợp nhất (Arbitration/Fusion): Tự động chọn kết quả tối ưu nhất cho từng ô.
-
-3. Xuất 1 file ảnh gồm 2 ảnh ghép ngang (Side-by-Side Dual-View Image):
-   - Bên trái: Ảnh gốc với các ô đã được quét (vẽ bounding box màu sắc + đánh số thứ tự #1, #2, #3...).
-   - Bên phải: Ảnh chữ viết ứng với từng ô đã quét (tọa độ tương ứng, render font tiếng Việt chuẩn Unicode,
-     kèm nhãn model nhận diện VietOCR / PP-OCRv6).
-=============================================================================
-"""
-
 import os
 import sys
 import json
@@ -45,10 +20,174 @@ if sys.stderr.encoding != "utf-8":
     except Exception:
         pass
 
+#0. MÔ HÌNH PHÁT HIỆN BỐ CỤC (YOLO LAYOUT DETECTOR)
+
+
+class YOLOLayoutDetector:
+    """
+    Module phát hiện bố cục các trường dữ liệu bằng mô hình YOLO fine-tuned.
+    Xử lý tốt tình huống tài liệu in hơi lệch, trôi lề, nghiêng nhẹ.
+    """
+
+    def __init__(
+        self, model_path: str = None, conf_thresh: float = 0.4, iou_thresh: float = 0.45
+    ):
+        self.conf_thresh = conf_thresh
+        self.iou_thresh = iou_thresh
+        self.model = None
+        self.is_simulated = False
+
+        # Tìm kiếm đường dẫn file weights phù hợp
+        candidate_paths = []
+        if model_path:
+            candidate_paths.append(model_path)
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate_paths.extend(
+            [
+                os.path.join(base_dir, "yolo26.pt"),
+                os.path.join(base_dir, "yolo26n.pt"),
+                os.path.join(base_dir, "yolo26x-obb.pt"),
+                os.path.join(base_dir, "best.pt"),
+                os.path.join(base_dir, "yolo_layout.pt"),
+                os.path.join(base_dir, "weights", "best.pt"),
+                "yolo26.pt",
+                "yolo26n.pt",
+                "yolo26x-obb.pt",
+                "best.pt",
+            ]
+        )
+
+        chosen_path = None
+        for path in candidate_paths:
+            if os.path.exists(path):
+                chosen_path = path
+                break
+
+        if chosen_path:
+            try:
+                from ultralytics import YOLO
+
+                print(
+                    f"[YOLO] Đang nạp weights YOLO Layout Fine-tuned từ: {chosen_path}"
+                )
+                self.model = YOLO(chosen_path)
+                print("[YOLO] Đã nạp thành công mô hình YOLO Layout!")
+            except Exception as e:
+                print(
+                    f"[YOLO Warning] Không thể nạp weights YOLO ({e}). Sẽ sử dụng Fallback Layout Engine."
+                )
+                self.is_simulated = True
+        else:
+            print(
+                "[YOLO Warning] Chưa phát hiện file weights YOLO fine-tune ('yolo26.pt' hoặc 'best.pt')."
+            )
+            print(
+                "              Hệ thống sẽ chạy ở chế độ Fallback Layout (PaddleOCR Det / Mock Field) để kiểm thử."
+            )
+            self.is_simulated = True
+
+    def detect(self, img_bgr: np.ndarray):
+        """
+        Dự đoán các vùng trường dữ liệu trên ảnh (hỗ trợ cả BBox chuẩn và OBB).
+
+        Returns:
+            list of dict: [
+                {
+                    "field_name": "id" / "ho_ten" / ...,
+                    "box": [x1, y1, x2, y2],
+                    "confidence": float
+                }, ...
+            ]
+        """
+        h, w = img_bgr.shape[:2]
+        detected_fields = []
+
+        if self.model and not self.is_simulated:
+            results = self.model.predict(
+                source=img_bgr,
+                conf=self.conf_thresh,
+                iou=self.iou_thresh,
+                verbose=False,
+            )
+            for r in results:
+                names = r.names or {}
+                # 1. Trường hợp mô hình Detection (BBox thẳng)
+                if r.boxes is not None and len(r.boxes) > 0:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0].item())
+                        field_name = names.get(cls_id, f"field_{cls_id}")
+                        conf = float(box.conf[0].item())
+                        xyxy = box.xyxy[0].tolist()
+                        x1, y1, x2, y2 = [int(round(coord)) for coord in xyxy]
+
+                        detected_fields.append(
+                            {
+                                "field_name": field_name,
+                                "box": [x1, y1, x2, y2],
+                                "confidence": conf,
+                            }
+                        )
+                # 2. Trường hợp mô hình OBB (Bounding Box xoay / nghiêng)
+                elif hasattr(r, "obb") and r.obb is not None and len(r.obb) > 0:
+                    for obb in r.obb:
+                        cls_id = int(obb.cls[0].item())
+                        field_name = names.get(cls_id, f"field_{cls_id}")
+                        conf = float(obb.conf[0].item())
+                        # Lấy bounding box bao ngoài từ tọa độ xyxy
+                        xyxy = obb.xyxy[0].tolist()
+                        x1, y1, x2, y2 = [int(round(coord)) for coord in xyxy]
+
+                        detected_fields.append(
+                            {
+                                "field_name": field_name,
+                                "box": [x1, y1, x2, y2],
+                                "confidence": conf,
+                            }
+                        )
+        else:
+            # Chế độ mô phỏng / Fallback khi chưa có file weights .pt
+            detected_fields = self._fallback_detection(img_bgr)
+
+        return detected_fields
+
+    def _fallback_detection(self, img_bgr: np.ndarray):
+        """
+        Fallback layout detector sử dụng hình ảnh mẫu hiện tại để minh họa quy trình.
+        """
+        h, w = img_bgr.shape[:2]
+        fields = []
+
+        # Mẫu 1: Nhận diện trường ID (nửa trên bên phải hoặc vị trí tiêu biểu)
+        # Giả lập 2 trường layout điển hình để test logic routing: ID và Họ tên
+        if h > 200 and w > 200:
+            # Trường Họ tên
+            fields.append(
+                {
+                    "field_name": "ho_ten",
+                    "box": [int(w * 0.1), int(h * 0.2), int(w * 0.9), int(h * 0.45)],
+                    "confidence": 0.92,
+                }
+            )
+            # Trường Số / Mã định danh ID
+            fields.append(
+                {
+                    "field_name": "id",
+                    "box": [int(w * 0.1), int(h * 0.55), int(w * 0.9), int(h * 0.85)],
+                    "confidence": 0.95,
+                }
+            )
+        else:
+            fields.append(
+                {"field_name": "text", "box": [0, 0, w, h], "confidence": 0.90}
+            )
+        return fields
+
 
 # ============================================================================
 # 1. TIỆN ÍCH HÌNH HỌC VÀ LỌC BỘ NHIỄU (GEOMETRY & FILTERING)
 # ============================================================================
+
 
 def compute_iou(box_a, box_b):
     """Tính chỉ số IoU và tỷ lệ chồng lấn diện tích giữa 2 bounding box [x1, y1, x2, y2]."""
@@ -80,8 +219,9 @@ def deduplicate_boxes(boxes_with_meta, iou_thresh=0.75):
     # Sắp xếp theo diện tích giảm dần
     sorted_items = sorted(
         boxes_with_meta,
-        key=lambda item: (item["box"][2] - item["box"][0]) * (item["box"][3] - item["box"][1]),
-        reverse=True
+        key=lambda item: (item["box"][2] - item["box"][0])
+        * (item["box"][3] - item["box"][1]),
+        reverse=True,
     )
 
     kept = []
@@ -107,7 +247,9 @@ def sort_reading_order(boxes_with_meta, y_tol=20):
         return []
 
     # Sắp xếp theo Y trước
-    sorted_y = sorted(boxes_with_meta, key=lambda item: (item["box"][1], item["box"][0]))
+    sorted_y = sorted(
+        boxes_with_meta, key=lambda item: (item["box"][1], item["box"][0])
+    )
     lines = []
 
     for item in sorted_y:
@@ -160,6 +302,7 @@ def crop_image_patch(image, box, pad_x=6, pad_y=4):
 # 2. BỘ PHÂN ĐOẠN KHUNG VÀ Ô (PP-DOCLAYOUTV3 + PP-STRUCTUREV3)
 # ============================================================================
 
+
 class DocumentStructureSegmenter:
     """
     Sử dụng PP-StructureV3 kết hợp mô hình phân tích bố cục PP-DocLayoutV3
@@ -167,6 +310,7 @@ class DocumentStructureSegmenter:
     - Danh sách Khung (Layout Frames): Khối tiêu đề, đoạn văn bản, bảng biểu, ảnh,...
     - Danh sách Ô (Cells): Ô trong bảng (Table Cells) và Ô chữ (Text line cells).
     """
+
     def __init__(self):
         print("=" * 75)
         print("1. KHỞI TẠO PIPELINE PP-STRUCTUREV3 KẾT HỢP PP-DOCLAYOUTV3...")
@@ -184,7 +328,7 @@ class DocumentStructureSegmenter:
     def segment(self, image_path: str):
         """
         Thực hiện phân tích cấu trúc tài liệu.
-        
+
         Returns:
             processed_bgr (np.ndarray): Ảnh đã căn chỉnh góc xoay.
             frames (list): Danh sách các khung bố cục lớn.
@@ -193,12 +337,16 @@ class DocumentStructureSegmenter:
         print(f"\n[+] Đang chia khung và ô trên tài liệu: {image_path}...")
         results = list(self.pipeline.predict(input=image_path))
         if not results:
-            raise RuntimeError(f"Không có kết quả trả về từ PP-StructureV3 cho file {image_path}")
+            raise RuntimeError(
+                f"Không có kết quả trả về từ PP-StructureV3 cho file {image_path}"
+            )
 
         res = results[0]
-        
+
         # Đọc ảnh gốc bằng OpenCV an toàn với ký tự Unicode
-        orig_img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        orig_img = cv2.imdecode(
+            np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
         if orig_img is None:
             raise ValueError(f"Không thể đọc file ảnh tại: {image_path}")
 
@@ -229,7 +377,9 @@ class DocumentStructureSegmenter:
         # --------------------------------------------------------------------
         frames = []
         layout_det_res = res.get("layout_det_res", {}) if hasattr(res, "get") else {}
-        layout_boxes = layout_det_res.get("boxes", []) if isinstance(layout_det_res, dict) else []
+        layout_boxes = (
+            layout_det_res.get("boxes", []) if isinstance(layout_det_res, dict) else []
+        )
 
         if not layout_boxes and hasattr(res, "get"):
             layout_boxes = res.get("parsing_res_list", [])
@@ -249,12 +399,14 @@ class DocumentStructureSegmenter:
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(img_w, x2), min(img_h, y2)
                 if x2 > x1 and y2 > y1:
-                    frames.append({
-                        "frame_id": idx + 1,
-                        "label": label,
-                        "score": round(score, 3),
-                        "box": [x1, y1, x2, y2]
-                    })
+                    frames.append(
+                        {
+                            "frame_id": idx + 1,
+                            "label": label,
+                            "score": round(score, 3),
+                            "box": [x1, y1, x2, y2],
+                        }
+                    )
 
         # --------------------------------------------------------------------
         # 2. TRÍCH XUẤT CÁC Ô (CELLS / TEXT BOXES)
@@ -265,7 +417,11 @@ class DocumentStructureSegmenter:
         table_res_list = res.get("table_res_list", []) if hasattr(res, "get") else []
         if table_res_list:
             for t_idx, table_item in enumerate(table_res_list):
-                cell_box_list = table_item.get("cell_box_list", []) if isinstance(table_item, dict) else getattr(table_item, "cell_box_list", [])
+                cell_box_list = (
+                    table_item.get("cell_box_list", [])
+                    if isinstance(table_item, dict)
+                    else getattr(table_item, "cell_box_list", [])
+                )
                 for c_idx, cbox in enumerate(cell_box_list):
                     if len(cbox) >= 4:
                         cx1, cy1, cx2, cy2 = [int(round(v)) for v in cbox[:4]]
@@ -273,11 +429,13 @@ class DocumentStructureSegmenter:
                         cx2, cy2 = min(img_w, cx2), min(img_h, cy2)
                         cw, ch = cx2 - cx1, cy2 - cy1
                         if cw >= 12 and ch >= 10:
-                            raw_cells.append({
-                                "source": "table_cell",
-                                "frame_label": f"table_{t_idx + 1}_cell",
-                                "box": [cx1, cy1, cx2, cy2]
-                            })
+                            raw_cells.append(
+                                {
+                                    "source": "table_cell",
+                                    "frame_label": f"table_{t_idx + 1}_cell",
+                                    "box": [cx1, cy1, cx2, cy2],
+                                }
+                            )
 
         # B. Trích xuất ô văn bản từ Overall OCR Res
         overall_ocr = res.get("overall_ocr_res", {}) if hasattr(res, "get") else {}
@@ -295,22 +453,31 @@ class DocumentStructureSegmenter:
                         for f in frames:
                             fx1, fy1, fx2, fy2 = f["box"]
                             # Nếu ô nằm phần lớn trong khung layout
-                            if rx1 >= fx1 - 10 and ry1 >= fy1 - 10 and rx2 <= fx2 + 10 and ry2 <= fy2 + 10:
+                            if (
+                                rx1 >= fx1 - 10
+                                and ry1 >= fy1 - 10
+                                and rx2 <= fx2 + 10
+                                and ry2 <= fy2 + 10
+                            ):
                                 parent_label = f["label"]
                                 break
 
-                        raw_cells.append({
-                            "source": "text_cell",
-                            "frame_label": parent_label,
-                            "box": [rx1, ry1, rx2, ry2]
-                        })
+                        raw_cells.append(
+                            {
+                                "source": "text_cell",
+                                "frame_label": parent_label,
+                                "box": [rx1, ry1, rx2, ry2],
+                            }
+                        )
 
         # Khử trùng lặp và sắp xếp thứ tự đọc tự nhiên
         deduped = deduplicate_boxes(raw_cells, iou_thresh=0.70)
         ordered_cells = sort_reading_order(deduped, y_tol=22)
 
         print(f"[+] PP-DocLayoutV3 chia được: {len(frames)} khung bố cục lớn.")
-        print(f"[+] PP-StructureV3 chia được: {len(ordered_cells)} ô cần nhận diện chữ.")
+        print(
+            f"[+] PP-StructureV3 chia được: {len(ordered_cells)} ô cần nhận diện chữ."
+        )
 
         return processed_img, frames, ordered_cells
 
@@ -319,12 +486,14 @@ class DocumentStructureSegmenter:
 # 3. HỆ THỐNG NHẬN DIỆN CHỮ KẾT HỢP (VIETOCR + PP-OCRV6)
 # ============================================================================
 
+
 class DualOCRRecognizer:
     """
     Hệ thống nhận diện chữ kết hợp song song:
     - VietOCR: Transformer cực mạnh về tiếng Việt có dấu, họ tên, ngữ pháp tiếng Việt.
     - PP-OCRv6: Cực nhanh và chuẩn xác về số, mã định danh, ký tự ID, ngày tháng.
     """
+
     def __init__(self, vietocr_weights_path: str = None):
         print("\n" + "=" * 75)
         print("2. KHỞI TẠO CÁC MODEL NHẬN DIỆN CHỮ: VIETOCR VÀ PP-OCRV6...")
@@ -340,9 +509,11 @@ class DualOCRRecognizer:
             vietocr_weights_path,
             os.path.join(base_dir, "vgg_transformer.pth"),
             os.path.join(os.getcwd(), "OCR_Project", "vgg_transformer.pth"),
-            "vgg_transformer.pth"
+            "vgg_transformer.pth",
         ]
-        chosen_weights = next((p for p in candidate_weights if p and os.path.exists(p)), None)
+        chosen_weights = next(
+            (p for p in candidate_weights if p and os.path.exists(p)), None
+        )
         if chosen_weights:
             config["weights"] = chosen_weights
             print(f"[VietOCR] Đã tìm thấy weights: {chosen_weights}")
@@ -355,23 +526,26 @@ class DualOCRRecognizer:
 
         # 2. PP-OCRv6 (PaddleOCR)
         from paddleocr import PaddleOCR
+
         self.ppocr_engine = PaddleOCR(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            lang="vi"
+            lang="vi",
         )
         print("[+] Khởi tạo PP-OCRv6 (PaddleOCR) thành công!")
 
         # Regex nhận biết các mẫu chuỗi thuần số, mã ID, ngày tháng, mã vạch
         self.code_pattern = re.compile(r"^[0-9\s\.\,\-\/\:\#\*\+\(\)]+$")
         self.alphanumeric_pattern = re.compile(r"^[A-Z0-9\-\/\.\:\#]+$")
-        self.vietnamese_vowels = set("àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđĐ")
+        self.vietnamese_vowels = set(
+            "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđĐ"
+        )
 
     def recognize_cell(self, patch_bgr: np.ndarray):
         """
         Nhận diện chữ trong 1 ô bằng VietOCR và PP-OCRv6, sau đó dung hợp thông minh.
-        
+
         Returns:
             dict chứa:
             - final_text: Chuỗi văn bản tối ưu nhất
@@ -381,7 +555,13 @@ class DualOCRRecognizer:
             - confidence: Độ tin cậy ước lượng
         """
         if patch_bgr is None or patch_bgr.size == 0:
-            return {"final_text": "", "chosen_model": "None", "vietocr_text": "", "ppocr_text": "", "confidence": 0.0}
+            return {
+                "final_text": "",
+                "chosen_model": "None",
+                "vietocr_text": "",
+                "ppocr_text": "",
+                "confidence": 0.0,
+            }
 
         # 1. Chạy VietOCR
         viet_text = ""
@@ -427,7 +607,11 @@ class DualOCRRecognizer:
             has_vi_vowel = any(c in self.vietnamese_vowels for c in viet_text)
 
             # A. Chuỗi thuần số, ngày tháng, mã barcode, serial, số điện thoại -> Chọn PP-OCRv6
-            if self.code_pattern.fullmatch(clean_pp) or (self.alphanumeric_pattern.fullmatch(clean_pp) and len(clean_pp) >= 4 and not has_vi_vowel):
+            if self.code_pattern.fullmatch(clean_pp) or (
+                self.alphanumeric_pattern.fullmatch(clean_pp)
+                and len(clean_pp) >= 4
+                and not has_vi_vowel
+            ):
                 final_text = ppocr_text
                 chosen_model = "PP-OCRv6"
                 conf = max(0.95, ppocr_conf)
@@ -452,7 +636,7 @@ class DualOCRRecognizer:
             "chosen_model": chosen_model,
             "vietocr_text": viet_text,
             "ppocr_text": ppocr_text,
-            "confidence": round(conf, 3)
+            "confidence": round(conf, 3),
         }
 
 
@@ -460,13 +644,9 @@ class DualOCRRecognizer:
 # 4. BỘ TRỰC QUAN HÓA VÀ XUẤT ẢNH GHÉP 2 TRONG 1 (DUAL-VIEW VISUALIZER)
 # ============================================================================
 
+
 class DualViewVisualizer:
-    """
-    Tạo và xuất 1 file ảnh gồm 2 ảnh đặt cạnh nhau (Side-by-Side):
-    - Bên trái: Ảnh gốc với các ô đã được quét (vẽ bounding box, số thứ tự #i).
-    - Bên phải: Ảnh canvas trắng thể hiện chữ viết ứng với từng ô đã quét
-      (vẽ tại tọa độ tương ứng, render tiếng Việt chuẩn Unicode, kèm nhãn model).
-    """
+
     def __init__(self):
         # Tìm font tiếng Việt chuẩn trong hệ thống Windows
         self.font_candidates = [
@@ -475,7 +655,9 @@ class DualViewVisualizer:
             "C:/Windows/Fonts/tahoma.ttf",
             "C:/Windows/Fonts/calibri.ttf",
         ]
-        self.font_path = next((f for f in self.font_candidates if os.path.exists(f)), "arial.ttf")
+        self.font_path = next(
+            (f for f in self.font_candidates if os.path.exists(f)), "arial.ttf"
+        )
 
     def _get_font(self, size: int, bold: bool = False):
         try:
@@ -502,7 +684,9 @@ class DualViewVisualizer:
             lines.append(current)
         return lines
 
-    def create_dual_view_image(self, original_bgr: np.ndarray, cells_with_ocr: list, header_title: str = ""):
+    def create_dual_view_image(
+        self, original_bgr: np.ndarray, cells_with_ocr: list, header_title: str = ""
+    ):
         """
         Ghép 2 ảnh: Trái (Ảnh gốc + ô quét) | Phải (Chữ viết ứng với từng ô).
         """
@@ -517,12 +701,12 @@ class DualViewVisualizer:
 
         # Bảng màu sắc nét cho từng loại ô
         color_palette = [
-            (0, 150, 255),    # Xanh dương / Cyan
-            (16, 185, 129),   # Xanh lục emerald
-            (245, 158, 11),   # Vàng cam amber
-            (139, 92, 246),   # Tím violet
-            (236, 72, 153),   # Hồng magenta
-            (239, 68, 68),    # Đỏ cam
+            (0, 150, 255),  # Xanh dương / Cyan
+            (16, 185, 129),  # Xanh lục emerald
+            (245, 158, 11),  # Vàng cam amber
+            (139, 92, 246),  # Tím violet
+            (236, 72, 153),  # Hồng magenta
+            (239, 68, 68),  # Đỏ cam
         ]
 
         for item in cells_with_ocr:
@@ -547,11 +731,13 @@ class DualViewVisualizer:
 
             # Nền badge màu nổi bật + chữ trắng
             left_draw.rectangle([bx1, by1, bx2, by2], fill=color)
-            left_draw.text((bx1 + 4, by1 + 2), badge_text, fill=(255, 255, 255), font=badge_font)
+            left_draw.text(
+                (bx1 + 4, by1 + 2), badge_text, fill=(255, 255, 255), font=badge_font
+            )
 
         # --------------------------------------------------------------------
         # 2. TẠO ẢNH BÊN PHẢI: CHỮ VIẾT ỨNG VỚI TỪNG Ô ĐÃ QUÉT
-        # --------------------------------------------------------------------
+
         right_pil = Image.new("RGB", (w_orig, h_orig), color=(250, 252, 255))
         right_draw = ImageDraw.Draw(right_pil)
 
@@ -567,11 +753,15 @@ class DualViewVisualizer:
             model_used = item.get("chosen_model", "")
 
             # A. Vẽ ô nền nhẹ tại tọa độ tương ứng với ảnh bên trái
-            right_draw.rectangle([x1, y1, x2, y2], fill=(241, 245, 249), outline=color, width=2)
+            right_draw.rectangle(
+                [x1, y1, x2, y2], fill=(241, 245, 249), outline=color, width=2
+            )
 
             # B. Badge số thứ tự và nhãn model
             model_tag = "VietOCR" if model_used == "VietOCR" else "PP-OCR"
-            tag_text = f"#{order_id} [{model_tag}]" if model_used != "None" else f"#{order_id}"
+            tag_text = (
+                f"#{order_id} [{model_tag}]" if model_used != "None" else f"#{order_id}"
+            )
             t_bbox = right_draw.textbbox((0, 0), tag_text, font=badge_font)
             badge_w = t_bbox[2] - t_bbox[0] + 8
             badge_h = t_bbox[3] - t_bbox[1] + 4
@@ -588,7 +778,9 @@ class DualViewVisualizer:
                     if other["order_id"] == order_id:
                         continue
                     ox1, oy1, ox2, oy2 = other["box"]
-                    if not (tab_x2 <= ox1 or tab_x1 >= ox2 or tab_y2 <= oy1 or tab_y1 >= oy2):
+                    if not (
+                        tab_x2 <= ox1 or tab_x1 >= ox2 or tab_y2 <= oy1 or tab_y1 >= oy2
+                    ):
                         overlaps_other = True
                         break
 
@@ -603,7 +795,12 @@ class DualViewVisualizer:
                 tab_y2 = tab_y1 + badge_h
 
             right_draw.rectangle([tab_x1, tab_y1, tab_x2, tab_y2], fill=color)
-            right_draw.text((tab_x1 + 4, tab_y1 + 1), tag_text, fill=(255, 255, 255), font=badge_font)
+            right_draw.text(
+                (tab_x1 + 4, tab_y1 + 1),
+                tag_text,
+                fill=(255, 255, 255),
+                font=badge_font,
+            )
 
             # C. Render văn bản tiếng Việt bên trong ô
             if text:
@@ -619,7 +816,9 @@ class DualViewVisualizer:
                     init_size -= 1
                     font = self._get_font(size=init_size)
                     line_height = int(init_size * 1.35)
-                    lines = self._wrap_text(right_draw, text, max_width=bw - 8, font=font)
+                    lines = self._wrap_text(
+                        right_draw, text, max_width=bw - 8, font=font
+                    )
                     total_text_h = len(lines) * line_height
 
                 # Căn giữa theo chiều dọc trong ô
@@ -627,7 +826,9 @@ class DualViewVisualizer:
                 for line_idx, line_str in enumerate(lines):
                     curr_y = start_y + line_idx * line_height
                     if curr_y + line_height <= y2 + 4:
-                        right_draw.text((x1 + 5, curr_y), line_str, fill=(15, 23, 42), font=font)
+                        right_draw.text(
+                            (x1 + 5, curr_y), line_str, fill=(15, 23, 42), font=font
+                        )
 
         # --------------------------------------------------------------------
         # 3. GHÉP 2 ẢNH VÀ THÊM THANH TIÊU ĐỀ HEADER CHUYÊN NGHIỆP
@@ -644,21 +845,45 @@ class DualViewVisualizer:
         # Nửa bên trái: Dark Slate Blue
         comp_draw.rectangle([0, 0, w_orig, banner_h], fill=(30, 41, 59))
         # Nửa bên phải: Dark Emerald Teal
-        comp_draw.rectangle([w_orig + divider_w, 0, total_w, banner_h], fill=(15, 118, 110))
+        comp_draw.rectangle(
+            [w_orig + divider_w, 0, total_w, banner_h], fill=(15, 118, 110)
+        )
         # Vạch phân cách giữa
-        comp_draw.rectangle([w_orig, 0, w_orig + divider_w, total_h], fill=(100, 116, 139))
+        comp_draw.rectangle(
+            [w_orig, 0, w_orig + divider_w, total_h], fill=(100, 116, 139)
+        )
 
         # Phông chữ tiêu đề
         title_font = self._get_font(size=22, bold=True)
         sub_font = self._get_font(size=14, bold=False)
 
         # Nội dung tiêu đề bên trái
-        comp_draw.text((25, 16), "[BÊN TRÁI: ẢNH GỐC CÁC Ô ĐÃ ĐƯỢC QUÉT]", fill=(255, 255, 255), font=title_font)
-        comp_draw.text((25, 52), "Phân đoạn: PP-DocLayoutV3 + PP-StructureV3 (Khung bố cục & Ô chữ)", fill=(148, 163, 184), font=sub_font)
+        comp_draw.text(
+            (25, 16),
+            "[BÊN TRÁI: ẢNH GỐC CÁC Ô ĐÃ ĐƯỢC QUÉT]",
+            fill=(255, 255, 255),
+            font=title_font,
+        )
+        comp_draw.text(
+            (25, 52),
+            "Phân đoạn: PP-DocLayoutV3 + PP-StructureV3 (Khung bố cục & Ô chữ)",
+            fill=(148, 163, 184),
+            font=sub_font,
+        )
 
         # Nội dung tiêu đề bên phải
-        comp_draw.text((w_orig + divider_w + 25, 16), "[BÊN PHẢI: CHỮ VIẾT ỨNG VỚI TỪNG Ô ĐÃ QUÉT]", fill=(255, 255, 255), font=title_font)
-        comp_draw.text((w_orig + divider_w + 25, 52), "Nhận diện chữ: VietOCR (Tiếng Việt) + PP-OCRv6 (Số / Mã ID)", fill=(167, 243, 208), font=sub_font)
+        comp_draw.text(
+            (w_orig + divider_w + 25, 16),
+            "[BÊN PHẢI: CHỮ VIẾT ỨNG VỚI TỪNG Ô ĐÃ QUÉT]",
+            fill=(255, 255, 255),
+            font=title_font,
+        )
+        comp_draw.text(
+            (w_orig + divider_w + 25, 52),
+            "Nhận diện chữ: VietOCR (Tiếng Việt) + PP-OCRv6 (Số / Mã ID)",
+            fill=(167, 243, 208),
+            font=sub_font,
+        )
 
         # B. Dán 2 ảnh trái và phải vào vị trí tương ứng
         composite.paste(left_pil, (0, banner_h))
@@ -669,12 +894,10 @@ class DualViewVisualizer:
 
 # ============================================================================
 # 5. PIPELINE THỰC THI HOÀN CHỈNH (MAIN CONTROLLER)
-# ============================================================================
+
 
 def run_document_dual_ocr_pipeline(
-    image_path: str,
-    output_dir: str = "output",
-    vietocr_weights: str = None
+    image_path: str, output_dir: str = "output", vietocr_weights: str = None
 ):
     """
     Quy trình tích hợp:
@@ -705,7 +928,9 @@ def run_document_dual_ocr_pipeline(
     recognizer = DualOCRRecognizer(vietocr_weights_path=vietocr_weights)
 
     print("\n" + "=" * 80)
-    print(f"{'Ô':<5} | {'BBOX [x1,y1,x2,y2]':<22} | {'MODEL CHỌN':<12} | {'KẾT QUẢ NHẬN DIỆN'}")
+    print(
+        f"{'Ô':<5} | {'BBOX [x1,y1,x2,y2]':<22} | {'MODEL CHỌN':<12} | {'KẾT QUẢ NHẬN DIỆN'}"
+    )
     print("=" * 80)
 
     cells_with_ocr = []
@@ -730,13 +955,15 @@ def run_document_dual_ocr_pipeline(
             "chosen_model": ocr_result["chosen_model"],
             "vietocr_text": ocr_result["vietocr_text"],
             "ppocr_text": ocr_result["ppocr_text"],
-            "confidence": ocr_result["confidence"]
+            "confidence": ocr_result["confidence"],
         }
         cells_with_ocr.append(cell_data)
 
         # In kết quả trực quan ra màn hình Console
         box_str = f"[{box[0]},{box[1]},{box[2]},{box[3]}]"
-        print(f"#{order_id:<4} | {box_str:<22} | {cell_data['chosen_model']:<12} | {cell_data['final_text']}")
+        print(
+            f"#{order_id:<4} | {box_str:<22} | {cell_data['chosen_model']:<12} | {cell_data['final_text']}"
+        )
 
     print("=" * 80)
 
@@ -746,7 +973,7 @@ def run_document_dual_ocr_pipeline(
     dual_view_image = visualizer.create_dual_view_image(
         original_bgr=processed_bgr,
         cells_with_ocr=cells_with_ocr,
-        header_title=f"Tài liệu: {os.path.basename(image_path)}"
+        header_title=f"Tài liệu: {os.path.basename(image_path)}",
     )
 
     output_img_path = os.path.join(output_dir, f"{stem_name}_dual_view.jpg")
@@ -755,13 +982,18 @@ def run_document_dual_ocr_pipeline(
     # 4. XUẤT DỮ LIỆU JSON VÀ MARKDOWN ĐỂ PHỤC VỤ TÍCH HỢP HỆ THỐNG
     output_json_path = os.path.join(output_dir, f"{stem_name}_dual_ocr.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "image_path": image_path,
-            "total_frames": len(frames),
-            "total_cells": len(cells_with_ocr),
-            "layout_frames": frames,
-            "scanned_cells": cells_with_ocr
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "image_path": image_path,
+                "total_frames": len(frames),
+                "total_cells": len(cells_with_ocr),
+                "layout_frames": frames,
+                "scanned_cells": cells_with_ocr,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     output_md_path = os.path.join(output_dir, f"{stem_name}_transcription.md")
     with open(output_md_path, "w", encoding="utf-8") as f:
@@ -771,7 +1003,9 @@ def run_document_dual_ocr_pipeline(
         f.write("| Ô | Khung Bố Cục | Model | Tọa Độ Box | Nội Dung Nhận Diện |\n")
         f.write("|---|---|---|---|---|\n")
         for c in cells_with_ocr:
-            f.write(f"| #{c['order_id']} | `{c['frame_label']}` | {c['chosen_model']} | `{c['box']}` | {c['final_text']} |\n")
+            f.write(
+                f"| #{c['order_id']} | `{c['frame_label']}` | {c['chosen_model']} | `{c['box']}` | {c['final_text']} |\n"
+            )
 
     print(f"\n[+] HOÀN THÀNH XUẤT SẮC!")
     print(f" [1] FILE ẢNH GHÉP 2 BÊN: {output_img_path}")
@@ -787,10 +1021,17 @@ def run_document_dual_ocr_pipeline(
 # ============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pipeline OCR: PP-DocLayoutV3 + PP-StructureV3 -> VietOCR + PP-OCRv6 -> Dual-View Image")
-    parser.add_argument("--image", type=str, default=None, help="Đường dẫn file ảnh tài liệu")
-    parser.add_argument("--output", type=str, default="output", help="Thư mục xuất kết quả")
-    parser.add_argument("--vietocr-weights", type=str, default=None, help="Đường dẫn file weights của VietOCR (.pth)")
+    parser = argparse.ArgumentParser(
+        description="Pipeline OCR: PP-DocLayoutV3 + PP-StructureV3 -> VietOCR + PP-OCRv6 -> Dual-View Image"
+    )
+    parser.add_argument("--image", type=str, default=None, help="Datasets")
+    parser.add_argument("--output", type=str, default="output", help="output")
+    parser.add_argument(
+        "--vietocr-weights",
+        type=str,
+        default=None,
+        help="vgg_transformer.pth",
+    )
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -799,15 +1040,16 @@ if __name__ == "__main__":
     else:
         # Danh sách các ảnh mẫu trong thư mục
         candidates = [
-            os.path.join(base_dir, "test_document.png"),
-            os.path.join(base_dir, "test_doc.jpg"),
-            os.path.join(base_dir, "test_ngang.jpg"),
-            "OCR_Project/test_document.png"
+            os.path.join(base_dir, "Datasets/Testcases/test_document.png"),
         ]
-        target_image = next((c for c in candidates if os.path.exists(c)), "OCR_Project/test_document.png")
+        target_image = next(
+            (c for c in candidates if os.path.exists(c)),
+            "Datasets/Testcases/test_document.png",
+        )
 
     run_document_dual_ocr_pipeline(
         image_path=target_image,
+        yolo_model_path=args.yolo_model,
         output_dir=args.output,
-        vietocr_weights=args.vietocr_weights
+        vietocr_weights=args.vietocr_weights,
     )

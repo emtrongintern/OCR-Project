@@ -9,34 +9,68 @@ from pathlib import Path
 from PIL import Image
 
 # Cấu hình encoding UTF-8 cho Windows Terminal để không bị lỗi font tiếng Việt
-if sys.stdout.encoding != 'utf-8':
+if sys.stdout.encoding != "utf-8":
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-if sys.stderr.encoding != 'utf-8':
+if sys.stderr.encoding != "utf-8":
     try:
-        sys.stderr.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
 
 
 # 1. BẢNG ĐỊNH TUYẾN TRƯỜNG DỮ LIỆU (FIELD ROUTING CONFIGURATION)
 
 # Nhóm các trường chữ số, mã định danh, ngày tháng -> Giao cho PP-OCRv6
 PPOCR_FIELD_KEYWORDS = {
-    'id', 'id_number', 'cccd', 'cmnd', 'code', 'number', 'so_dinh_danh',
-    'ma_so', 'phone', 'so_dien_thoai', 'dob', 'ngay_sinh', 'date', 'ngay_thang',
-    'stt', 'serial', 'so_ho_chieu', 'passport_no', 'tax_code', 'ma_so_thue'
+    "id",
+    "id_number",
+    "cccd",
+    "cmnd",
+    "code",
+    "number",
+    "so_dinh_danh",
+    "ma_so",
+    "phone",
+    "so_dien_thoai",
+    "dob",
+    "ngay_sinh",
+    "date",
+    "ngay_thang",
+    "stt",
+    "serial",
+    "so_ho_chieu",
+    "passport_no",
+    "tax_code",
+    "ma_so_thue",
 }
 
 # Nhóm các trường họ tên, văn bản tiếng Việt -> Giao cho VietOCR
 VIETOCR_FIELD_KEYWORDS = {
-    'name', 'ho_ten', 'full_name', 'ten', 'ho_va_ten',
-    'address', 'dia_chi', 'que_quan', 'noi_sinh', 'noi_tru', 'thuong_tru',
-    'gender', 'gioi_tinh', 'nationality', 'quoc_tich', 'dan_toc',
-    'job', 'nghe_nghiep', 'title', 'tieu_de', 'text', 'ghi_chu'
+    "name",
+    "ho_ten",
+    "full_name",
+    "ten",
+    "ho_va_ten",
+    "address",
+    "dia_chi",
+    "que_quan",
+    "noi_sinh",
+    "noi_tru",
+    "thuong_tru",
+    "gender",
+    "gioi_tinh",
+    "nationality",
+    "quoc_tich",
+    "dan_toc",
+    "job",
+    "nghe_nghiep",
+    "title",
+    "tieu_de",
+    "text",
+    "ghi_chu",
 }
 
 
@@ -44,12 +78,12 @@ def determine_ocr_engine(field_name: str, draft_text: str = "") -> str:
     """
     Quyết định chọn model OCR phù hợp dựa trên nhãn trường từ YOLO.
     Nếu nhãn chưa rõ, dùng thêm heuristic kiểm tra nội dung text nháp.
-    
+
     Returns:
         'ppocr_v6' hoặc 'vietocr'
     """
     field_lower = field_name.lower().strip()
-    
+
     # 1. Kiểm tra theo nhãn trường do YOLO phân loại
     for kw in PPOCR_FIELD_KEYWORDS:
         if kw in field_lower:
@@ -63,66 +97,86 @@ def determine_ocr_engine(field_name: str, draft_text: str = "") -> str:
     if draft_text:
         text_clean = draft_text.replace(" ", "")
         # Nếu chuỗi thuần số từ 6 ký tự trở lên hoặc dạng mã A-Z0-9
-        if re.fullmatch(r'[0-9\.\-\/]+', text_clean) or (re.fullmatch(r'[A-Z0-9\-]+', text_clean) and len(text_clean) >= 4):
+        if re.fullmatch(r"[0-9\.\-\/]+", text_clean) or (
+            re.fullmatch(r"[A-Z0-9\-]+", text_clean) and len(text_clean) >= 4
+        ):
             return "ppocr_v6"
 
     # Mặc định văn bản tiếng Việt chuyển sang VietOCR
     return "vietocr"
 
 
-
 # 2. MÔ HÌNH PHÁT HIỆN BỐ CỤC (YOLO LAYOUT DETECTOR)
+
 
 class YOLOLayoutDetector:
     """
     Module phát hiện bố cục các trường dữ liệu bằng mô hình YOLO fine-tuned.
     Xử lý tốt tình huống tài liệu in hơi lệch, trôi lề, nghiêng nhẹ.
     """
-    def __init__(self, model_path: str = None, conf_thresh: float = 0.4, iou_thresh: float = 0.45):
+
+    def __init__(
+        self, model_path: str = None, conf_thresh: float = 0.4, iou_thresh: float = 0.45
+    ):
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
         self.model = None
         self.is_simulated = False
-        
+
         # Tìm kiếm đường dẫn file weights phù hợp
         candidate_paths = []
         if model_path:
             candidate_paths.append(model_path)
-            
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        candidate_paths.extend([
-            os.path.join(base_dir, "yolo26.pt"),
-            os.path.join(base_dir, "best.pt"),
-            os.path.join(base_dir, "yolo_layout.pt"),
-            os.path.join(base_dir, "weights", "best.pt"),
-            "yolo26.pt",
-            "best.pt"
-        ])
-        
+        candidate_paths.extend(
+            [
+                os.path.join(base_dir, "yolo26.pt"),
+                os.path.join(base_dir, "yolo26n.pt"),
+                os.path.join(base_dir, "yolo26x-obb.pt"),
+                os.path.join(base_dir, "best.pt"),
+                os.path.join(base_dir, "yolo_layout.pt"),
+                os.path.join(base_dir, "weights", "best.pt"),
+                "yolo26.pt",
+                "yolo26n.pt",
+                "yolo26x-obb.pt",
+                "best.pt",
+            ]
+        )
+
         chosen_path = None
         for path in candidate_paths:
             if os.path.exists(path):
                 chosen_path = path
                 break
-                
+
         if chosen_path:
             try:
                 from ultralytics import YOLO
-                print(f"[YOLO] Đang nạp weights YOLO Layout Fine-tuned từ: {chosen_path}")
+
+                print(
+                    f"[YOLO] Đang nạp weights YOLO Layout Fine-tuned từ: {chosen_path}"
+                )
                 self.model = YOLO(chosen_path)
                 print("[YOLO] Đã nạp thành công mô hình YOLO Layout!")
             except Exception as e:
-                print(f"[YOLO Warning] Không thể nạp weights YOLO ({e}). Sẽ sử dụng Fallback Layout Engine.")
+                print(
+                    f"[YOLO Warning] Không thể nạp weights YOLO ({e}). Sẽ sử dụng Fallback Layout Engine."
+                )
                 self.is_simulated = True
         else:
-            print("[YOLO Warning] Chưa phát hiện file weights YOLO fine-tune ('yolo26.pt' hoặc 'best.pt').")
-            print("              Hệ thống sẽ chạy ở chế độ Fallback Layout (PaddleOCR Det / Mock Field) để kiểm thử.")
+            print(
+                "[YOLO Warning] Chưa phát hiện file weights YOLO fine-tune ('yolo26.pt' hoặc 'best.pt')."
+            )
+            print(
+                "              Hệ thống sẽ chạy ở chế độ Fallback Layout (PaddleOCR Det / Mock Field) để kiểm thử."
+            )
             self.is_simulated = True
 
     def detect(self, img_bgr: np.ndarray):
         """
-        Dự đoán các vùng trường dữ liệu trên ảnh.
-        
+        Dự đoán các vùng trường dữ liệu trên ảnh (hỗ trợ cả BBox chuẩn và OBB).
+
         Returns:
             list of dict: [
                 {
@@ -140,24 +194,43 @@ class YOLOLayoutDetector:
                 source=img_bgr,
                 conf=self.conf_thresh,
                 iou=self.iou_thresh,
-                verbose=False
+                verbose=False,
             )
             for r in results:
-                boxes = r.boxes
-                if boxes is None:
-                    continue
-                for box in boxes:
-                    cls_id = int(box.cls[0].item())
-                    field_name = r.names.get(cls_id, f"field_{cls_id}")
-                    conf = float(box.conf[0].item())
-                    xyxy = box.xyxy[0].tolist()
-                    x1, y1, x2, y2 = [int(round(coord)) for coord in xyxy]
-                    
-                    detected_fields.append({
-                        "field_name": field_name,
-                        "box": [x1, y1, x2, y2],
-                        "confidence": conf
-                    })
+                names = r.names or {}
+                # 1. Trường hợp mô hình Detection (BBox thẳng)
+                if r.boxes is not None and len(r.boxes) > 0:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0].item())
+                        field_name = names.get(cls_id, f"field_{cls_id}")
+                        conf = float(box.conf[0].item())
+                        xyxy = box.xyxy[0].tolist()
+                        x1, y1, x2, y2 = [int(round(coord)) for coord in xyxy]
+
+                        detected_fields.append(
+                            {
+                                "field_name": field_name,
+                                "box": [x1, y1, x2, y2],
+                                "confidence": conf,
+                            }
+                        )
+                # 2. Trường hợp mô hình OBB (Bounding Box xoay / nghiêng)
+                elif hasattr(r, "obb") and r.obb is not None and len(r.obb) > 0:
+                    for obb in r.obb:
+                        cls_id = int(obb.cls[0].item())
+                        field_name = names.get(cls_id, f"field_{cls_id}")
+                        conf = float(obb.conf[0].item())
+                        # Lấy bounding box bao ngoài từ tọa độ xyxy
+                        xyxy = obb.xyxy[0].tolist()
+                        x1, y1, x2, y2 = [int(round(coord)) for coord in xyxy]
+
+                        detected_fields.append(
+                            {
+                                "field_name": field_name,
+                                "box": [x1, y1, x2, y2],
+                                "confidence": conf,
+                            }
+                        )
         else:
             # Chế độ mô phỏng / Fallback khi chưa có file weights .pt
             detected_fields = self._fallback_detection(img_bgr)
@@ -170,35 +243,39 @@ class YOLOLayoutDetector:
         """
         h, w = img_bgr.shape[:2]
         fields = []
-        
+
         # Mẫu 1: Nhận diện trường ID (nửa trên bên phải hoặc vị trí tiêu biểu)
         # Giả lập 2 trường layout điển hình để test logic routing: ID và Họ tên
         if h > 200 and w > 200:
             # Trường Họ tên
-            fields.append({
-                "field_name": "ho_ten",
-                "box": [int(w * 0.1), int(h * 0.2), int(w * 0.9), int(h * 0.45)],
-                "confidence": 0.92
-            })
+            fields.append(
+                {
+                    "field_name": "ho_ten",
+                    "box": [int(w * 0.1), int(h * 0.2), int(w * 0.9), int(h * 0.45)],
+                    "confidence": 0.92,
+                }
+            )
             # Trường Số / Mã định danh ID
-            fields.append({
-                "field_name": "id",
-                "box": [int(w * 0.1), int(h * 0.55), int(w * 0.9), int(h * 0.85)],
-                "confidence": 0.95
-            })
+            fields.append(
+                {
+                    "field_name": "id",
+                    "box": [int(w * 0.1), int(h * 0.55), int(w * 0.9), int(h * 0.85)],
+                    "confidence": 0.95,
+                }
+            )
         else:
-            fields.append({
-                "field_name": "text",
-                "box": [0, 0, w, h],
-                "confidence": 0.90
-            })
+            fields.append(
+                {"field_name": "text", "box": [0, 0, w, h], "confidence": 0.90}
+            )
         return fields
-
 
 
 # 3. TIỆN ÍCH CẮT VÙNG ẢNH CÓ PADDING (GIẢI PHÁP CHO IN HƠI LỆCH)
 
-def crop_field_with_padding(img_bgr: np.ndarray, box: list, padding_x: int = 6, padding_y: int = 4):
+
+def crop_field_with_padding(
+    img_bgr: np.ndarray, box: list, padding_x: int = 6, padding_y: int = 4
+):
     """
     Cắt vùng ảnh theo bounding box của YOLO kết hợp thêm lề (padding) an toàn.
     Lợi ích:
@@ -221,8 +298,8 @@ def crop_field_with_padding(img_bgr: np.ndarray, box: list, padding_x: int = 6, 
     return cropped, [x1_pad, y1_pad, x2_pad, y2_pad]
 
 
-
 # 4. HỆ THỐNG OCR KẾT HỢP (PP-OCRV6 + VIETOCR)
+
 
 class HybridDocumentOCR:
     """
@@ -230,6 +307,7 @@ class HybridDocumentOCR:
     - PP-OCRv6: Chuyên số, ID, mã số, ngày sinh
     - VietOCR: Chuyên họ tên, văn bản tiếng Việt có dấu
     """
+
     def __init__(self, vietocr_weights_path: str = None):
         print("=" * 70)
         print("KHỞI TẠO CÁC MÔ HÌNH OCR CHUYÊN TRÁCH...")
@@ -238,11 +316,12 @@ class HybridDocumentOCR:
         # 1. Khởi tạo PP-OCRv6 (Tối ưu tốc độ, tắt xoay toàn trang vì ảnh đã crop)
         print("[1/2] Đang nạp mô hình PP-OCRv6 (PaddleOCR)...")
         from paddleocr import PaddleOCR
+
         self.ppocr_engine = PaddleOCR(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            lang='en'  # Model English đọc số và ký tự ID cực sạch, không lỗi dấu
+            lang="en",  # Model English đọc số và ký tự ID cực sạch, không lỗi dấu
         )
         print("[1/2] Đã nạp thành công PP-OCRv6!")
 
@@ -250,20 +329,20 @@ class HybridDocumentOCR:
         print("[2/2] Đang nạp mô hình VietOCR (VGG-Transformer)...")
         from vietocr.tool.predictor import Predictor
         from vietocr.tool.config import Cfg
-        
-        config = Cfg.load_config_from_name('vgg_transformer')
+
+        config = Cfg.load_config_from_name("vgg_transformer")
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        
+
         if vietocr_weights_path and os.path.exists(vietocr_weights_path):
-            config['weights'] = vietocr_weights_path
+            config["weights"] = vietocr_weights_path
         else:
-            default_weights = os.path.join(base_dir, 'vgg_transformer.pth')
+            default_weights = os.path.join(base_dir, "vgg_transformer.pth")
             if os.path.exists(default_weights):
-                config['weights'] = default_weights
+                config["weights"] = default_weights
             else:
                 print(f"[VietOCR Info] Sử dụng weights mặc định tải từ internet.")
-                
-        config['device'] = 'cpu'
+
+        config["device"] = "cpu"
         self.vietocr_engine = Predictor(config)
         print("[2/2] Đã nạp thành công VietOCR!")
         print("=" * 70)
@@ -279,11 +358,11 @@ class HybridDocumentOCR:
             if results and isinstance(results, list):
                 for res in results:
                     if isinstance(res, dict):
-                        t_list = res.get('rec_texts', [])
-                        s_list = res.get('rec_scores', [])
+                        t_list = res.get("rec_texts", [])
+                        s_list = res.get("rec_scores", [])
                         texts.extend(t_list)
                         scores.extend(s_list)
-            
+
             final_text = " ".join(texts).strip()
             avg_score = float(np.mean(scores)) if scores else 0.95
             return final_text, avg_score
@@ -306,18 +385,23 @@ class HybridDocumentOCR:
             return "", 0.0
 
 
-
 # 5. PIPELINE XỬ LÝ TOÀN DIỆN (YOLO DETECT -> ROUTING -> OCR -> EXPORT)
-def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str = "output"):
+def run_pipeline(
+    image_path: str, yolo_model_path: str = None, output_dir: str = "output"
+):
     """
     Thực thi toàn bộ quy trình nhận dạng tài liệu theo layout.
     """
     if not os.path.exists(image_path):
-        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(image_path))
+        alt = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.path.basename(image_path)
+        )
         if os.path.exists(alt):
             image_path = alt
         else:
-            raise FileNotFoundError(f"Không tìm thấy file ảnh tài liệu tại: {image_path}")
+            raise FileNotFoundError(
+                f"Không tìm thấy file ảnh tài liệu tại: {image_path}"
+            )
 
     # 1. Đọc ảnh an toàn với đường dẫn tiếng Việt trên Windows
     img_bgr = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -330,7 +414,9 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
     # 2. Phát hiện layout bằng YOLO Fine-tuned
     layout_detector = YOLOLayoutDetector(model_path=yolo_model_path)
     detected_fields = layout_detector.detect(img_bgr)
-    print(f"[YOLO] Phát hiện được {len(detected_fields)} trường layout trên tài liệu.\n")
+    print(
+        f"[YOLO] Phát hiện được {len(detected_fields)} trường layout trên tài liệu.\n"
+    )
 
     # 3. Khởi tạo engine OCR
     ocr_system = HybridDocumentOCR()
@@ -339,7 +425,9 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
     annotated_img = img_bgr.copy()
 
     print("=" * 75)
-    print(f"{'TRƯỜNG':<15} | {'MODEL CHỌN':<15} | {'ĐỘ TIN CẬY':<10} | {'KẾT QUẢ NHẬN DIỆN'}")
+    print(
+        f"{'TRƯỜNG':<15} | {'MODEL CHỌN':<15} | {'ĐỘ TIN CẬY':<10} | {'KẾT QUẢ NHẬN DIỆN'}"
+    )
     print("=" * 75)
 
     # 4. Xử lý từng trường theo nguyên tắc Routing
@@ -349,7 +437,9 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
         det_conf = field["confidence"]
 
         # Cắt ảnh có padding an toàn chống lệch in
-        cropped_patch, padded_box = crop_field_with_padding(img_bgr, raw_box, padding_x=8, padding_y=4)
+        cropped_patch, padded_box = crop_field_with_padding(
+            img_bgr, raw_box, padding_x=8, padding_y=4
+        )
         if cropped_patch is None or cropped_patch.size == 0:
             continue
 
@@ -363,28 +453,38 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
         else:
             recognized_text, ocr_conf = ocr_system.recognize_with_vietocr(cropped_patch)
             model_display = "VietOCR (Họ tên)"
-            box_color = (0, 180, 0)    # Xanh lá cây
+            box_color = (0, 180, 0)  # Xanh lá cây
 
-        print(f"{field_name:<15} | {model_display:<15} | {ocr_conf:<10.2f} | {recognized_text}")
+        print(
+            f"{field_name:<15} | {model_display:<15} | {ocr_conf:<10.2f} | {recognized_text}"
+        )
 
-        results_data.append({
-            "order": i + 1,
-            "field_name": field_name,
-            "box": padded_box,
-            "yolo_confidence": round(det_conf, 3),
-            "ocr_model": model_display,
-            "ocr_confidence": round(ocr_conf, 3),
-            "text": recognized_text
-        })
+        results_data.append(
+            {
+                "order": i + 1,
+                "field_name": field_name,
+                "box": padded_box,
+                "yolo_confidence": round(det_conf, 3),
+                "ocr_model": model_display,
+                "ocr_confidence": round(ocr_conf, 3),
+                "text": recognized_text,
+            }
+        )
 
         # 5. Vẽ trực quan lên ảnh kết quả
         px1, py1, px2, py2 = padded_box
         cv2.rectangle(annotated_img, (px1, py1), (px2, py2), box_color, 2)
-        
+
         # Nhãn hiển thị trên ảnh
         tag = f"{field_name} [{chosen_engine.upper()}]: {recognized_text}"
         # Nền nhãn
-        cv2.rectangle(annotated_img, (px1, max(0, py1 - 22)), (min(w_img, px1 + len(tag) * 9), py1), box_color, -1)
+        cv2.rectangle(
+            annotated_img,
+            (px1, max(0, py1 - 22)),
+            (min(w_img, px1 + len(tag) * 9), py1),
+            box_color,
+            -1,
+        )
         cv2.putText(
             annotated_img,
             tag,
@@ -393,7 +493,7 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
             0.45,
             (255, 255, 255),
             1,
-            cv2.LINE_AA
+            cv2.LINE_AA,
         )
 
     print("=" * 75)
@@ -405,16 +505,21 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
     # Lưu file JSON
     json_path = os.path.join(output_dir, f"{stem_name}_layout_result.json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "document_path": image_path,
-            "image_size": {"width": w_img, "height": h_img},
-            "total_fields": len(results_data),
-            "fields": results_data
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "document_path": image_path,
+                "image_size": {"width": w_img, "height": h_img},
+                "total_fields": len(results_data),
+                "fields": results_data,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # Lưu ảnh trực quan
     img_out_path = os.path.join(output_dir, f"{stem_name}_annotated.jpg")
-    cv2.imencode('.jpg', annotated_img)[1].tofile(img_out_path)
+    cv2.imencode(".jpg", annotated_img)[1].tofile(img_out_path)
 
     print(f"\n[XUẤT KẾT QUẢ THÀNH CÔNG]:")
     print(f" [+] File JSON trích xuất trường: {json_path}")
@@ -429,25 +534,37 @@ def run_pipeline(image_path: str, yolo_model_path: str = None, output_dir: str =
 # ============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OCR Layout Pipeline: YOLO Fine-tuned + PP-OCRv6 + VietOCR")
-    parser.add_argument("--image", type=str, default=None, help="Đường dẫn file ảnh tài liệu")
-    parser.add_argument("--yolo-model", type=str, default=None, help="Đường dẫn file weights YOLO (yolo26.pt / best.pt)")
-    parser.add_argument("--output", type=str, default="output", help="Thư mục lưu kết quả")
+    parser = argparse.ArgumentParser(
+        description="OCR Layout Pipeline: YOLO Fine-tuned + PP-OCRv6 + VietOCR"
+    )
+    parser.add_argument(
+        "--image", type=str, default=None, help="OCR/Datasets"
+    )
+    parser.add_argument(
+        "--yolo-model",
+        type=str,
+        default=None,
+        help="OCR_Project/yolo26x-obb.pt",
+    )
+    parser.add_argument(
+        "--output", type=str, default="output", help="OCR/output"
+    )
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     # Nếu không truyền qua tham số dòng lệnh, tự tìm file ảnh có sẵn để test
     if args.image:
         target_image = args.image
     else:
         test_candidates = [
-            os.path.join(base_dir, "testchuviettay.png"),
+            os.path.join(base_dir, "Datasets/Testcases/test_document.png"),
         ]
-        target_image = next((c for c in test_candidates if os.path.exists(c)), "OCR_Project/test_document.png")
+        target_image = next(
+            (c for c in test_candidates if os.path.exists(c)),
+            "Datasets/Testcases/test_document.png",
+        )
 
     run_pipeline(
-        image_path=target_image,
-        yolo_model_path=args.yolo_model,
-        output_dir=args.output
+        image_path=target_image, yolo_model_path=args.yolo_model, output_dir=args.output
     )
