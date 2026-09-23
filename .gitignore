@@ -34,3 +34,7 @@ Desktop.ini
 ~$*.docx
 ~$*.xlsx
 ~$*.pptx
+
+.venv/
+.venv-1/
+Ocr.venv/
